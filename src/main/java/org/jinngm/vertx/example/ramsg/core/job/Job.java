@@ -1,18 +1,26 @@
 package org.jinngm.vertx.example.ramsg.core.job;
 
 import io.vertx.codegen.annotations.DataObject;
+import io.vertx.core.AsyncResult;
+import io.vertx.core.Future;
+import io.vertx.core.Handler;
 import io.vertx.core.Vertx;
 import io.vertx.core.eventbus.EventBus;
 import io.vertx.core.json.JsonObject;
 import io.vertx.core.logging.Logger;
 import io.vertx.core.logging.LoggerFactory;
 import io.vertx.redis.RedisClient;
+import org.jinngm.vertx.example.ramsg.core.util.RedisHelper;
+
+import java.util.Objects;
+import java.util.UUID;
 
 /**
  * Created by guming on 2017/10/25.
  */
 @DataObject(generateConverter = true)
 public class Job {
+
     private static Logger logger = LoggerFactory.getLogger(Job.class);
     private static Vertx vertx;
     private static RedisClient redis;
@@ -26,6 +34,7 @@ public class Job {
 
     //props
     private long id=-1;
+    private String zid;
     private String uuid;
     private String type;
     private JsonObject data;
@@ -54,8 +63,13 @@ public class Job {
     }
 
 
+    public String getZid() {
+        return zid;
+    }
 
-
+    public void setZid(String zid) {
+        this.zid = zid;
+    }
 
     public long getId() {
         return id;
@@ -216,4 +230,142 @@ public class Job {
     public void setDuration(long duration) {
         this.duration = duration;
     }
+
+    public Job() {
+        this.uuid = UUID.randomUUID().toString();
+        _checkStatic();
+    }
+
+    public Job(String type, JsonObject data) {
+        this.type = type;
+        this.data = data;
+        this.uuid = UUID.randomUUID().toString();
+        _checkStatic();
+    }
+
+    public JsonObject toJson() {
+        JsonObject json = new JsonObject();
+        JobConvert.toJson(this, json);
+        return json;
+    }
+
+    public Future<Job> state(JobState newState){
+        Future<Job> future = Future.future();
+        RedisClient redisClient = RedisClient.create(vertx);
+        JobState oldState = this.state;
+        redisClient.transaction().multi(h -> {
+            if (h.succeeded()) {
+                if (oldState != null && !oldState.equals(newState)) {
+                    redisClient.transaction().zrem(RedisHelper.getKey("jobs:" + this.type + ":" + oldState.name()), this.zid, _failure())
+                            .zrem(RedisHelper.getStateKey(oldState), this.zid, _failure());
+                }
+                redisClient.transaction().hset(RedisHelper.getKey("job:" + this.id), "state", newState.name(), _failure())
+                        .zadd(RedisHelper.getKey("jobs:" + this.type + ":" + newState.name()), this.priority.getValue(), this.zid, _failure())
+                        .zadd(RedisHelper.getStateKey(newState), this.priority.getValue(), this.zid, _failure());
+                switch (newState) { // dispatch different state
+                    case ACTIVE:
+                        redisClient.transaction().zadd(RedisHelper.getKey("jobs:" + newState.name()),
+                                this.priority.getValue() < 0 ? this.priority.getValue() : -this.priority.getValue(),
+                                this.zid, _failure());
+                        break;
+                    case DELAYED:
+                        redisClient.transaction().zadd(RedisHelper.getKey("jobs:" + newState.name()),
+                                this.promote_at, this.zid, _failure());
+                        break;
+                    case INACTIVE:
+                        redisClient.transaction().lpush(RedisHelper.getKey(this.type + ":jobs"), "1", _failure());
+                        break;
+                    default:
+                }
+
+                this.state = newState;
+
+                redisClient.transaction().exec(e -> {
+                    if (e.succeeded()) {
+                        future.complete(this);
+                    } else {
+                        future.fail(e.cause());
+                    }
+                });
+
+
+            } else {
+                future.fail(h.cause());
+            }
+            });
+        return future.compose(Job::updateNow);
+    }
+
+    private static <T> Handler<AsyncResult<T>>_failure(){
+        return r->{
+          if(r.failed()){
+              r.cause().printStackTrace();
+          }
+        };
+    }
+
+    private static <T,R> Handler<AsyncResult<T>>_complete(Future<R> future, R result){
+        return r->{
+            if(r.failed()){
+                future.fail(r.cause());
+            }else {
+                future.complete(result);
+            }
+        };
+    }
+
+    public Future<Job> save(){
+        Objects.requireNonNull(this.type,"this job type must not be null");
+        if(this.id>0){
+
+        }
+        Future<Job> future = Future.future();
+        redis.incr(RedisHelper.getKey("ids"),r->{
+            if(r.succeeded()){
+                this.id = r.result();
+                this.zid = RedisHelper.createFIFO(id);
+                String key = RedisHelper.getKey("job:" + this.id);
+                if(this.delay>0){
+                    this.state = JobState.DELAYED;
+                }
+                this.created_at = System.currentTimeMillis();
+                this.promote_at = this.created_at + this.delay;
+                redis.sadd(RedisHelper.getKey("job:types"), this.type, _failure());
+                redis.hmset(key,this.toJson(),_complete(future,this));
+            }else {
+                future.fail(r.cause());
+            }
+        });
+        return future.compose(Job::update);
+    }
+
+    public Future<Job> update(){
+        Future future = Future.future();
+        this.updated_at = System.currentTimeMillis();
+        redis.transaction()
+                .multi(_failure())
+                .hset(RedisHelper.getKey("job:" + this.id), "updated_at", String.valueOf(this.updated_at), _failure())
+                .zadd(RedisHelper.getKey("jobs"), priority.getValue(), this.zid, _failure())
+                .exec(_complete(future, this));
+        return future.compose(r-> this.state(this.state));
+    }
+
+    public Future<Job> updateNow() {
+        this.updated_at = System.currentTimeMillis();
+        return this.set("updated_at", String.valueOf(updated_at));
+    }
+
+    public Future<Job> set(String key, String value) {
+        Future<Job> future = Future.future();
+        redis.hset(RedisHelper.getKey("job:" + this.id), key, value, r -> {
+            if (r.succeeded())
+                future.complete(this);
+            else
+                future.fail(r.cause());
+        });
+        return future;
+    }
+
+
+
 }

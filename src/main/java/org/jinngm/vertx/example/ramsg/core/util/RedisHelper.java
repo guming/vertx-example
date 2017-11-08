@@ -31,5 +31,20 @@ public final class RedisHelper {
         return VERTX_KUE_REDIS_PREFIX + ":jobs:" + state.name();
     }
 
+    public static String createFIFO(long id) {
+        String idLen = "" + ("" + id).length();
+        int len = 2 - idLen.length();
+        while (len-- > 0)
+            idLen = "0" + idLen;
+        return idLen + "|" + id;
+    }
+
+    public static String stripFIFO(String zid) {
+        return zid.substring(zid.indexOf('|') + 1);
+    }
+
+    public static long numStripFIFO(String zid) {
+        return Long.parseLong(zid.substring(zid.indexOf('|') + 1));
+    }
 
 }
