@@ -1,15 +1,19 @@
 package org.jinngm.vertx.example.ramsg.core.job;
 
 import io.vertx.codegen.annotations.DataObject;
+import io.vertx.codegen.annotations.Fluent;
 import io.vertx.core.AsyncResult;
 import io.vertx.core.Future;
 import io.vertx.core.Handler;
 import io.vertx.core.Vertx;
 import io.vertx.core.eventbus.EventBus;
+import io.vertx.core.eventbus.Message;
 import io.vertx.core.json.JsonObject;
 import io.vertx.core.logging.Logger;
 import io.vertx.core.logging.LoggerFactory;
 import io.vertx.redis.RedisClient;
+import org.jinngm.vertx.example.ramsg.core.queue.Kue;
+import org.jinngm.vertx.example.ramsg.core.util.EventBusAddressHelper;
 import org.jinngm.vertx.example.ramsg.core.util.RedisHelper;
 
 import java.util.Objects;
@@ -163,8 +167,9 @@ public class Job {
         return progress;
     }
 
-    public void setProgress(int progress) {
+    public Job setProgress(int progress) {
         this.progress = progress;
+        return this;
     }
 
     public JsonObject getResult() {
@@ -249,6 +254,60 @@ public class Job {
         return json;
     }
 
+    /**
+     * persistent method
+     */
+    public Future<Job> active(){
+        return this.state(JobState.ACTIVE);
+    }
+
+    public Future<Job> inactive(){
+        return this.state(JobState.ACTIVE);
+    }
+
+    public Future<Job> delay(){
+        return this.state(JobState.DELAYED);
+    }
+
+    public Future<Job> complete(){
+        return this.setProgress(100).set("progress","100")
+                .compose(Job::updateNow)
+                .compose(r->r.state(JobState.COMPLETE));
+    }
+
+    public Future<Job> fail(){
+        this.failed_at = System.currentTimeMillis();
+        return this.updateNow()
+                .compose(r -> r.set("failed_at",String.valueOf(this.failed_at)))
+                .compose(j -> j.state(JobState.FAILED));
+    }
+
+    /*
+        job entity update
+     */
+    public Future<Job> set(String key, String value) {
+        Future<Job> future = Future.future();
+        redis.hset(RedisHelper.getKey("job:" + this.id), key, value, r -> {
+            if (r.succeeded())
+                future.complete(this);
+            else
+                future.fail(r.cause());
+        });
+        return future;
+    }
+    /*
+            get attr of job
+         */
+    @Fluent
+    public Future<String> get(String key) {
+        Future<String> future = Future.future();
+        redis.hget(RedisHelper.getKey("job:" + this.id), key, future.completer());
+        return future;
+    }
+
+    /*
+        job persistent method
+     */
     public Future<Job> state(JobState newState){
         Future<Job> future = Future.future();
         RedisClient redisClient = RedisClient.create(vertx);
@@ -296,24 +355,9 @@ public class Job {
         return future.compose(Job::updateNow);
     }
 
-    private static <T> Handler<AsyncResult<T>>_failure(){
-        return r->{
-          if(r.failed()){
-              r.cause().printStackTrace();
-          }
-        };
-    }
-
-    private static <T,R> Handler<AsyncResult<T>>_complete(Future<R> future, R result){
-        return r->{
-            if(r.failed()){
-                future.fail(r.cause());
-            }else {
-                future.complete(result);
-            }
-        };
-    }
-
+    /*
+           job persistent method
+        */
     public Future<Job> save(){
         Objects.requireNonNull(this.type,"this job type must not be null");
         if(this.id>0){
@@ -338,34 +382,84 @@ public class Job {
         });
         return future.compose(Job::update);
     }
-
+    /*
+           job persistent method
+        */
     public Future<Job> update(){
         Future future = Future.future();
         this.updated_at = System.currentTimeMillis();
         redis.transaction()
                 .multi(_failure())
-                .hset(RedisHelper.getKey("job:" + this.id), "updated_at", String.valueOf(this.updated_at), _failure())
+//                .hset(RedisHelper.getKey("job:" + this.id), "updated_at", String.valueOf(this.updated_at), _failure())
                 .zadd(RedisHelper.getKey("jobs"), priority.getValue(), this.zid, _failure())
                 .exec(_complete(future, this));
         return future.compose(r-> this.state(this.state));
     }
-
+    /*
+           job persistent method
+        */
     public Future<Job> updateNow() {
         this.updated_at = System.currentTimeMillis();
         return this.set("updated_at", String.valueOf(updated_at));
     }
-
-    public Future<Job> set(String key, String value) {
-        Future<Job> future = Future.future();
-        redis.hset(RedisHelper.getKey("job:" + this.id), key, value, r -> {
-            if (r.succeeded())
-                future.complete(this);
-            else
-                future.fail(r.cause());
-        });
+    /*
+           job persistent method
+        */
+    public Future<Void> remove(){
+        Future future = Future.future();
+        redis.transaction().multi(_failure())
+                .zrem(RedisHelper.getKey("jobs:" + this.state.name()), this.zid, _failure())
+                .zrem(RedisHelper.getKey("jobs:" + this.type + ":" + this.state.name()), this.zid, _failure())
+                .zrem(RedisHelper.getKey("jobs"), this.zid, _failure())
+                .del(RedisHelper.getKey("job:" + this.id + ":log"), _failure())
+                .del(RedisHelper.getKey("job:" + this.id), _failure())
+                .exec(r->{
+                    if(r.succeeded()){
+                        this.emit("remove", new JsonObject().put("id", this.id));
+                        future.complete();
+                    }else{
+                        future.fail(r.cause());
+                    }
+                });
         return future;
+    }
+
+    public Future<Job> log(String msg) {
+        Future<Job> future = Future.future();
+        redis.rpush(RedisHelper.getKey("job:" + this.id + ":log"), msg, _complete(future, this));
+        return future.compose(Job::updateNow);
     }
 
 
 
+
+
+    private Job emit(String jobEvent,Object msg){
+        logger.info("jobEvent:"+jobEvent+",msg:"+msg);
+        eventBus.send(EventBusAddressHelper.getCertainJobAddress(jobEvent,this), msg);
+        return this;
+    }
+
+    private <T> Job on(String jobEvent,Handler<Message<T>> handler){
+        eventBus.consumer(EventBusAddressHelper.getCertainJobAddress(jobEvent,this),handler);
+        return this;
+    }
+
+    private static <T> Handler<AsyncResult<T>>_failure(){
+        return r->{
+            if(r.failed()){
+                r.cause().printStackTrace();
+            }
+        };
+    }
+
+    private static <T,R> Handler<AsyncResult<T>>_complete(Future<R> future, R result){
+        return r->{
+            if(r.failed()){
+                future.fail(r.cause());
+            }else {
+                future.complete(result);
+            }
+        };
+    }
 }
