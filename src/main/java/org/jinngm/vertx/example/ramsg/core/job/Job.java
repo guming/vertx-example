@@ -18,6 +18,7 @@ import org.jinngm.vertx.example.ramsg.core.util.RedisHelper;
 
 import java.util.Objects;
 import java.util.UUID;
+import java.util.function.Function;
 
 /**
  * Created by guming on 2017/10/25.
@@ -248,6 +249,7 @@ public class Job {
         _checkStatic();
     }
 
+
     public JsonObject toJson() {
         JsonObject json = new JsonObject();
         JobConvert.toJson(this, json);
@@ -265,7 +267,7 @@ public class Job {
         return this.state(JobState.ACTIVE);
     }
 
-    public Future<Job> delay(){
+    public Future<Job> delayed(){
         return this.state(JobState.DELAYED);
     }
 
@@ -275,7 +277,7 @@ public class Job {
                 .compose(r->r.state(JobState.COMPLETE));
     }
 
-    public Future<Job> fail(){
+    public Future<Job> failed(){
         this.failed_at = System.currentTimeMillis();
         return this.updateNow()
                 .compose(r -> r.set("failed_at",String.valueOf(this.failed_at)))
@@ -431,6 +433,17 @@ public class Job {
     }
 
 
+    public Future<Job> reattempt(){
+        if(this.backoff!=null){
+            long delay = this.getBackoffImpl().apply(this.delay);
+            this.setDelay(delay);
+            this.setPromote_at(System.currentTimeMillis()+delay);
+            return this.update().compose(Job::delayed);
+        }else{
+            return this.inactive();
+        }
+    }
+
 
 
 
@@ -443,6 +456,18 @@ public class Job {
     private <T> Job on(String jobEvent,Handler<Message<T>> handler){
         eventBus.consumer(EventBusAddressHelper.getCertainJobAddress(jobEvent,this),handler);
         return this;
+    }
+
+    private Function<Long, Long> getBackoffImpl() {
+        String type = this.backoff.getString("type", "fixed");
+        long _delay = this.backoff.getLong("delay", this.delay);
+        switch (type) {
+            case "exponential":
+                return attempts -> Math.round(_delay * 0.5 * (Math.pow(2, attempts) - 1));
+            case "fixed":
+            default:
+                return attempts -> _delay;
+        }
     }
 
     private static <T> Handler<AsyncResult<T>>_failure(){
