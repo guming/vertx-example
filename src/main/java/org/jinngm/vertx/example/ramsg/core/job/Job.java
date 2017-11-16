@@ -249,6 +249,32 @@ public class Job {
         _checkStatic();
     }
 
+    public Job(JsonObject json) { // TODO: optimize this!
+        JobConvert.fromJson(json, this);
+        this.uuid = json.getString("uuid");
+        // generated converter cannot handle this
+        if (this.data == null) {
+            this.data = new JsonObject(json.getString("data"));
+            if (json.getValue("backoff") != null) {
+                this.backoff = new JsonObject(json.getString("backoff"));
+            }
+            this.progress = Integer.parseInt(json.getString("progress"));
+            this.attempts = Integer.parseInt(json.getString("attempts"));
+            this.max_attempts = Integer.parseInt(json.getString("max_attempts"));
+            this.created_at = Long.parseLong(json.getString("created_at"));
+            this.updated_at = Long.parseLong(json.getString("updated_at"));
+            this.started_at = Long.parseLong(json.getString("started_at"));
+            this.promote_at = Long.parseLong(json.getString("promote_at"));
+            this.delay = Long.parseLong(json.getString("delay"));
+            this.duration = Long.parseLong(json.getString("duration"));
+        }
+        if (this.id < 0) {
+            if ((json.getValue("id")) instanceof CharSequence)
+                this.setId(Long.parseLong(json.getString("id")));
+        }
+        _checkStatic();
+    }
+
 
     public JsonObject toJson() {
         JsonObject json = new JsonObject();
@@ -282,6 +308,12 @@ public class Job {
         return this.updateNow()
                 .compose(r -> r.set("failed_at",String.valueOf(this.failed_at)))
                 .compose(j -> j.state(JobState.FAILED));
+    }
+
+    public Future<Job> failedAttempt(Throwable err) {
+        return this.error(err)
+                .compose(Job::failed)
+                .compose(Job::attemptInternal);
     }
 
     /*
@@ -444,7 +476,110 @@ public class Job {
         }
     }
 
+    public Future<Job> attemptAdd(){
+        Future<Job> future = Future.future();
+        String key = RedisHelper.getKey("job:" + this.id);
+        if(max_attempts>attempts){
+            redis.hincrby(key,"attempts",1,r->{
+               if(r.succeeded()) {
+                   this.attempts = r.result().intValue();
+                   future.complete(this);
+               }else{
+                   future.fail(r.cause());
+               }
+            });
+        }else{
+            future.complete(this);
+        }
+        return future;
+    }
 
+    public Future<Job> attemptInternal(){
+        Future<Job> future = Future.future();
+        long remaining = this.max_attempts - this.attempts;
+        if(remaining>0){
+            return this.attemptAdd().compose(Job::reattempt).setHandler(r->{
+                if(r.failed()){
+                    this.emitError(r.cause());
+                }
+            });
+
+        }else if (remaining == 0) {
+            return Future.failedFuture("No more attempts");
+        } else {
+            return Future.failedFuture(new IllegalStateException("Attempts Exceeded"));
+        }
+    }
+
+
+
+    public Future<Job> error(Throwable ex) {
+        return this.emitError(ex)
+                .set("error", ex.getMessage())
+                .compose(j -> j.log("error | " + ex.getMessage()));
+    }
+
+    public Job onComplete(Handler<Job> completeHandler){
+        this.on("complete", message -> {
+            completeHandler.handle(new Job((JsonObject)message.body()));
+        });
+        return this;
+    }
+
+    public Job onFailure(Handler<Job> failureHandler){
+        this.on("failed", message -> {
+            failureHandler.handle(new Job((JsonObject)message.body()));
+        });
+        return this;
+    }
+
+    public Job onFailureAttempt(Handler<Job> failureHandler){
+        this.on("failed_attempt", message -> {
+            failureHandler.handle(new Job((JsonObject)message.body()));
+        });
+        return this;
+    }
+
+    public Job onProgress(Handler<Integer> progressHandler) {
+        this.on("progress", message -> {
+            progressHandler.handle((Integer) message.body());
+        });
+        return this;
+    }
+
+    public Job onStart(Handler<Job> handler) {
+        this.on("start", message -> {
+            handler.handle(new Job((JsonObject) message.body()));
+        });
+        return this;
+    }
+
+    public Job onRemove(Handler<JsonObject> removeHandler) {
+        this.on("remove", message -> {
+            removeHandler.handle((JsonObject) message.body());
+        });
+        return this;
+    }
+
+    public Job onPromotion(Handler<Job> handler) {
+        this.on("promotion", message -> {
+            handler.handle(new Job((JsonObject) message.body()));
+        });
+        return this;
+    }
+
+    /*
+     * send message to eventbus
+     */
+
+
+    public Job emitError(Throwable ex){
+        JsonObject errorMessage = new JsonObject().put("id", this.id)
+                .put("message", ex.getMessage());
+        eventBus.send(EventBusAddressHelper.getCertainJobAddress("error",this), errorMessage);
+        eventBus.send(EventBusAddressHelper.workerAddress("error"), errorMessage);
+        return this;
+    }
 
 
     private Job emit(String jobEvent,Object msg){
@@ -452,9 +587,22 @@ public class Job {
         eventBus.send(EventBusAddressHelper.getCertainJobAddress(jobEvent,this), msg);
         return this;
     }
+    /*
+        registe handler on eventbus
+     */
 
     private <T> Job on(String jobEvent,Handler<Message<T>> handler){
         eventBus.consumer(EventBusAddressHelper.getCertainJobAddress(jobEvent,this),handler);
+        return this;
+    }
+
+    public Job done(Throwable ex) {
+        eventBus.send(EventBusAddressHelper.workerAddress("done_fail", this), ex.getMessage());
+        return this;
+    }
+
+    public Job done() {
+        eventBus.send(EventBusAddressHelper.workerAddress("done", this), this.toJson());
         return this;
     }
 
@@ -469,6 +617,8 @@ public class Job {
                 return attempts -> _delay;
         }
     }
+
+
 
     private static <T> Handler<AsyncResult<T>>_failure(){
         return r->{

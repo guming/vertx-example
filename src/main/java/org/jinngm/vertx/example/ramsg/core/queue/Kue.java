@@ -26,4 +26,6 @@ public class Kue {
         Job.setVertx(vertx, RedisHelper.client(vertx, config)); // init static vertx instance inner job
     }
 
+
+
 }
